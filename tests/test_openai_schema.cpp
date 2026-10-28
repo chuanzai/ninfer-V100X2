@@ -478,6 +478,61 @@ int test_parse_tool_history_messages() {
     return failures;
 }
 
+int test_parse_tool_content_parts() {
+    int failures = 0;
+    const Json assistant_call =
+        Json{{"role", "assistant"},
+             {"content", nullptr},
+             {"tool_calls", Json::array({Json{{"id", "call_1"},
+                                              {"type", "function"},
+                                              {"function", Json{{"name", "get_weather"},
+                                                                {"arguments", R"({"city":"Paris"})"}}}}})}};
+    const auto tool_body = [&](Json content) {
+        return Json{{"model", "m"},
+                    {"messages",
+                     Json::array({Json{{"role", "user"}, {"content", "weather?"}},
+                                  assistant_call,
+                                  Json{{"role", "tool"},
+                                       {"tool_call_id", "call_1"},
+                                       {"content", std::move(content)}}})}};
+    };
+
+    // Spec form `Array<ContentPart>`: text parts are concatenated in order.
+    GenerationRequest req = parse_chat_completion_request(
+        tool_body(Json::array({Json{{"type", "text"}, {"text", "temp="}},
+                               Json{{"type", "text"}, {"text", "20C"}}})),
+        default_limits());
+    failures += check(req.messages.size() == 3, "tool array content message count");
+    failures +=
+        check(req.messages[2].content.size() == 1, "tool array content collapsed into one part");
+    failures += check(req.messages[2].content.at(0).text == "temp=20C",
+                      "tool array text parts concatenated in order");
+
+    // A tool that produced no output: null or absent content is an empty result, not a 400.
+    req = parse_chat_completion_request(tool_body(nullptr), default_limits());
+    failures += check(req.messages.size() == 3 && req.messages[2].content.at(0).text.empty(),
+                      "null tool content tolerated as empty");
+    Json absent = tool_body(nullptr);
+    absent["messages"][2].erase("content");
+    req = parse_chat_completion_request(absent, default_limits());
+    failures += check(req.messages.size() == 3 && req.messages[2].content.at(0).text.empty(),
+                      "absent tool content tolerated as empty");
+
+    // Everything else stays a 400, but with a message that names the accepted shapes.
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(tool_body(42), default_limits()); }),
+        "numeric tool content rejected");
+    failures += check(throws_api([&] {
+                          (void)parse_chat_completion_request(
+                              tool_body(Json::array(
+                                  {Json{{"type", "image_url"},
+                                        {"image_url", Json{{"url", "data:image/png;base64,AA"}}}}})),
+                              default_limits());
+                      }),
+                      "media tool content part rejected");
+    return failures;
+}
+
 int test_parse_stop_and_max_tokens() {
     int failures          = 0;
     Json body             = {{"model", "m"},
@@ -803,6 +858,7 @@ int main() {
     failures += test_reject_unsupported();
     failures += test_parse_function_tools_and_choices();
     failures += test_parse_tool_history_messages();
+    failures += test_parse_tool_content_parts();
     failures += test_parse_stop_and_max_tokens();
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();
