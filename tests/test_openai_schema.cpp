@@ -522,14 +522,40 @@ int test_parse_tool_content_parts() {
     failures += check(
         throws_api([&] { (void)parse_chat_completion_request(tool_body(42), default_limits()); }),
         "numeric tool content rejected");
+
+    // image_url parts inside a tool result become media parts: the Anthropic entry point has
+    // always accepted images inside tool_result, and the chat template renders a media part the
+    // same way under any role.
+    req = parse_chat_completion_request(
+        tool_body(Json::array(
+            {Json{{"type", "text"}, {"text", "screenshot:"}},
+             Json{{"type", "image_url"},
+                  {"image_url", Json{{"url", "data:image/png;base64,iVBORw0KGgo="}}}}})),
+        default_limits());
+    failures += check(req.messages[2].content.size() == 2,
+                      "tool text and image kept as two parts");
+    failures += check(req.messages[2].content.at(0).kind == ContentKind::Text &&
+                          req.messages[2].content.at(0).text == "screenshot:",
+                      "tool text part before image kept");
+    failures += check(req.messages[2].content.at(1).kind == ContentKind::Image,
+                      "tool image part carried as media");
+
+    // Text runs stay separate around a media part, so an image never glues two strings together.
+    req = parse_chat_completion_request(
+        tool_body(Json::array({Json{{"type", "text"}, {"text", "before"}},
+                               Json{{"type", "image_url"},
+                                    {"image_url", Json{{"url", "data:image/png;base64,AA"}}}},
+                               Json{{"type", "text"}, {"text", "after"}}})),
+        default_limits());
+    failures += check(req.messages[2].content.size() == 3,
+                      "text runs stay split around a tool image");
+
     failures += check(throws_api([&] {
                           (void)parse_chat_completion_request(
-                              tool_body(Json::array(
-                                  {Json{{"type", "image_url"},
-                                        {"image_url", Json{{"url", "data:image/png;base64,AA"}}}}})),
+                              tool_body(Json::array({Json{{"type", "input_audio"}}})),
                               default_limits());
                       }),
-                      "media tool content part rejected");
+                      "unsupported tool content part rejected");
     return failures;
 }
 

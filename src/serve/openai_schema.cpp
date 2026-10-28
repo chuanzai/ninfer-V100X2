@@ -187,37 +187,66 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
 
 // OpenAI chat completions declares tool message content as `string | Array<ContentPart>`. This
 // server used to accept only the string form, so any client that forwards a tool result as
-// `[{"type":"text","text":...}]` was rejected with a 400 that blamed the client. Text parts are
-// concatenated in order; media parts are rejected explicitly instead of being silently dropped,
-// because dropping them would change what the model sees without telling the caller.
-std::string parse_tool_message_text(const Json& item, std::size_t index) {
+// `[{"type":"text","text":...}]` was rejected with a 400 that blamed the client.
+//
+// Consecutive text parts are merged into a single part: translate.cpp inserts a "\n" between
+// adjacent text parts, so keeping them split would alter the text the caller sent.
+//
+// image_url parts are carried through as media. The Anthropic entry point already accepts images
+// inside tool_result, and the chat template renders a media part identically under any role, so
+// refusing them here only made the two protocols disagree about the same content. Anything else
+// is rejected explicitly rather than dropped, because dropping it would silently change what the
+// model sees.
+std::vector<ContentPart> parse_tool_message_content(const Json& item, std::size_t index) {
     const std::string where = "tool message " + std::to_string(index);
+    std::vector<ContentPart> parts;
+    const auto push_text = [&parts](std::string text) {
+        if (!parts.empty() && parts.back().kind == ContentKind::Text) {
+            parts.back().text += text;
+            return;
+        }
+        parts.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
+    };
     if (!item.contains("content") || item.at("content").is_null()) {
         // Clients send null/absent content when a tool produced no output. Treat that as an empty
         // result instead of failing the whole turn: the empty text part renders no prompt tokens.
-        return {};
+        push_text(std::string());
+        return parts;
     }
     const Json& content = item.at("content");
-    if (content.is_string()) { return content.get<std::string>(); }
+    if (content.is_string()) {
+        push_text(content.get<std::string>());
+        return parts;
+    }
     if (!content.is_array()) {
         bad_request(where + " content must be a string or an array of content parts", "messages");
     }
-    std::string text;
     for (const Json& part : content) {
         if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) {
             bad_request(where + " content parts must be objects with a string 'type'", "messages");
         }
         const std::string type = part.at("type").get<std::string>();
-        if (type != "text") {
-            bad_request(where + " content parts must be of type 'text', got '" + type + "'",
-                        "messages");
+        if (type == "text") {
+            if (!part.contains("text") || !part.at("text").is_string()) {
+                bad_request("text content part must contain a string 'text'", "messages");
+            }
+            push_text(part.at("text").get<std::string>());
+            continue;
         }
-        if (!part.contains("text") || !part.at("text").is_string()) {
-            bad_request("text content part must contain a string 'text'", "messages");
+        if (type == "image_url") {
+            ContentPart image;
+            image.kind     = ContentKind::Image;
+            image.type_raw = type;
+            image.source   = parse_media_url(part, "image_url");
+            parts.push_back(std::move(image));
+            continue;
         }
-        text += part.at("text").get<std::string>();
+        bad_request(where + " content parts must be of type 'text' or 'image_url', got '" + type +
+                        "'",
+                    "messages");
     }
-    return text;
+    if (parts.empty()) { push_text(std::string()); }
+    return parts;
 }
 
 std::vector<ToolCall> parse_assistant_tool_calls(const Json& item, std::size_t index) {
@@ -293,8 +322,7 @@ void parse_messages(const Json& body, GenerationRequest& out) {
                 bad_request("tool messages must contain a string tool_call_id", "messages");
             }
             turn.tool_call_id = item.at("tool_call_id").get<std::string>();
-            turn.content.push_back(
-                ContentPart{ContentKind::Text, parse_tool_message_text(item, i), "text"});
+            turn.content      = parse_tool_message_content(item, i);
             out.messages.push_back(std::move(turn));
             continue;
         }
