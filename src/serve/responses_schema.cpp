@@ -112,11 +112,10 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
         if (!part.at("detail").is_string()) {
             bad_request("input_image.detail must be a string", "input");
         }
-        const std::string detail = part.at("detail").get<std::string>();
-        if (detail != "auto") {
-            bad_request("only input_image detail 'auto' is supported", "input",
-                        "image_detail_not_supported");
-        }
+        // NOTE(local-v100 2026-10-29): detail (auto/low/high) selects how much OpenAI downsamples
+        // an image before encoding. NInfer never downsamples, so every value takes the same path;
+        // accept them instead of 400-ing clients that ask for "high" or "low".
+        (void) part.at("detail").get<std::string>();
     }
 
     ninfer::product::media_acquire::Source source;
@@ -329,8 +328,8 @@ ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
         item.at("call_id").get<std::string>().empty()) {
         bad_request("function_call_output must contain a non-empty call_id", "input");
     }
-    if (!item.contains("output") || !item.at("output").is_string()) {
-        bad_request("function_call_output output must be a string", "input");
+    if (!item.contains("output") || item.at("output").is_null()) {
+        bad_request("function_call_output must contain output", "input");
     }
     if (item.contains("status") && !item.at("status").is_null() &&
         (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
@@ -339,16 +338,79 @@ ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
     ChatTurn turn;
     turn.role         = ChatRole::Tool;
     turn.tool_call_id = item.at("call_id").get<std::string>();
-    ContentPart content;
-    content.kind     = ContentKind::Text;
-    content.type_raw = "input_text";
-    content.text     = item.at("output").get<std::string>();
-    turn.content.push_back(std::move(content));
+
+    // NOTE(local-v100 2026-10-29): OpenAI declares function_call_output.output as
+    // `string | Array<ContentPart>`, and the Chat Completions endpoint already accepts the array
+    // form for tool messages -- refusing it here made the two protocols disagree about identical
+    // content. Consecutive text parts are merged because translate.cpp joins adjacent text parts
+    // with a newline; keeping them split would change the text the caller sent.
+    const Json& output = item.at("output");
+    Json canonical_output;
+    if (output.is_string()) {
+        ContentPart content;
+        content.kind     = ContentKind::Text;
+        content.type_raw = "input_text";
+        content.text     = output.get<std::string>();
+        turn.content.push_back(std::move(content));
+        canonical_output = output;
+    } else if (output.is_array()) {
+        canonical_output = Json::array();
+        for (const Json& raw : output) {
+            if (!raw.is_object() || !raw.contains("type") || !raw.at("type").is_string()) {
+                bad_request("function_call_output content parts must be objects with a string type",
+                            "input");
+            }
+            const std::string part_type = raw.at("type").get<std::string>();
+            if (part_type == "input_text" || part_type == "output_text" || part_type == "text") {
+                if (!raw.contains("text") || !raw.at("text").is_string()) {
+                    bad_request("function_call_output text part must contain a string text",
+                                "input");
+                }
+                const std::string text = raw.at("text").get<std::string>();
+                if (!turn.content.empty() && turn.content.back().kind == ContentKind::Text) {
+                    turn.content.back().text += text;
+                } else {
+                    ContentPart content;
+                    content.kind     = ContentKind::Text;
+                    content.type_raw = "input_text";
+                    content.text     = text;
+                    turn.content.push_back(std::move(content));
+                }
+                canonical_output.push_back(Json{{"type", "input_text"}, {"text", text}});
+                continue;
+            }
+            if (part_type == "input_image") {
+                ContentPart part;
+                part.kind     = ContentKind::Image;
+                part.type_raw = part_type;
+                part.source   = parse_image_source(raw);
+                turn.content.push_back(std::move(part));
+                canonical_output.push_back(Json{{"type", "input_image"},
+                                                {"image_url", raw.at("image_url")},
+                                                {"detail", "auto"}});
+                continue;
+            }
+            bad_request("function_call_output content parts must be input_text or input_image, got "
+                        "'" + part_type + "'",
+                        "input");
+        }
+        if (turn.content.empty()) {
+            ContentPart content;
+            content.kind     = ContentKind::Text;
+            content.type_raw = "input_text";
+            turn.content.push_back(std::move(content));
+            canonical_output.push_back(Json{{"type", "input_text"}, {"text", ""}});
+        }
+    } else {
+        bad_request("function_call_output output must be a string or an array of content parts",
+                    "input");
+    }
+
     canonical = {{"id", item_id(item, "fco", "input")},
                  {"type", "function_call_output"},
                  {"status", "completed"},
                  {"call_id", turn.tool_call_id},
-                 {"output", item.at("output")}};
+                 {"output", canonical_output}};
     return turn;
 }
 
@@ -478,10 +540,11 @@ void parse_tools(const Json& body, ResponsesRequest& out) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("function strict must be a boolean", "tools");
             }
-            if (item.at("strict").get<bool>()) {
-                bad_request("strict function schema enforcement is not supported", "tools",
-                            "strict_tools_not_supported");
-            }
+            // NOTE(local-v100 2026-10-29): strict=true only asks the server to make the model's
+            // arguments conform to the JSON schema. NInfer has no schema-constrained decoding, so
+            // the flag is a no-op -- but nearly every OpenAI SDK / agent harness sends
+            // strict=true by default, so failing the whole request over it is far worse than
+            // running unconstrained. Accept and ignore; tool.strict stays false internally.
         }
         tool.strict          = false;
         tool.parameters_json = parameters.dump();
@@ -513,15 +576,33 @@ void parse_tool_choice(const Json& body, ResponsesRequest& out) {
         } else if (value == "none") {
             out.generation.tool_choice.mode = ToolChoiceMode::None;
         } else if (value == "required") {
-            bad_request("tool_choice 'required' is not supported", "tool_choice",
-                        "tool_choice_not_supported");
+            // NOTE(local-v100 2026-10-29): "required" cannot be enforced during decoding, but
+            // agent harnesses send it constantly. Accept it and let the model decide instead of
+            // killing every turn of such a client with a 400.
+            out.generation.tool_choice.mode = ToolChoiceMode::Required;
         } else {
-            bad_request("tool_choice must be 'auto' or 'none'", "tool_choice");
+            bad_request("tool_choice must be 'auto', 'none' or 'required'", "tool_choice");
         }
         out.tool_choice = value;
     } else if (choice.is_object()) {
-        bad_request("named tool_choice is not supported", "tool_choice",
-                    "tool_choice_not_supported");
+        // NOTE(local-v100 2026-10-29): Responses spells a named choice flat
+        // ({"type":"function","name":"foo"}); Chat Completions nests it under "function". Accept
+        // either shape. Forcing one function during decoding is not implemented, so the choice is
+        // recorded and rendered into the prompt rather than enforced.
+        std::string chosen;
+        if (choice.contains("name") && choice.at("name").is_string()) {
+            chosen = choice.at("name").get<std::string>();
+        } else if (choice.contains("function") && choice.at("function").is_object() &&
+                   choice.at("function").contains("name") &&
+                   choice.at("function").at("name").is_string()) {
+            chosen = choice.at("function").at("name").get<std::string>();
+        }
+        if (chosen.empty()) {
+            bad_request("tool_choice object must name a function", "tool_choice");
+        }
+        out.generation.tool_choice.mode = ToolChoiceMode::Named;
+        out.generation.tool_choice.name = chosen;
+        out.tool_choice                 = choice;
     } else {
         bad_request("tool_choice must be a string or object", "tool_choice");
     }
@@ -532,7 +613,11 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
     const Json& reasoning = body.at("reasoning");
     if (!reasoning.is_object()) { bad_request("reasoning must be an object", "reasoning"); }
     for (auto it = reasoning.begin(); it != reasoning.end(); ++it) {
-        if (it.key() != "effort" && !it.value().is_null()) {
+        // NOTE(local-v100 2026-10-29): "summary" asks for a reasoning summary in the response.
+        // NInfer emits its own reasoning deltas, so there is nothing to configure -- ignore the
+        // hint instead of failing clients (Codex-style harnesses) that always send it.
+        const bool ignorable = it.key() == "summary";
+        if (it.key() != "effort" && !ignorable && !it.value().is_null()) {
             bad_request("reasoning." + it.key() + " is not supported", "reasoning",
                         "reasoning_option_not_supported");
         }
@@ -614,9 +699,14 @@ void reject_unknown_top_level(const Json& body) {
 }
 
 void reject_server_managed_features(const Json& body) {
+    // NOTE(local-v100 2026-10-29): prompt_cache_key / prompt_cache_options /
+    // prompt_cache_retention / safety_identifier / user are client-side metadata hints only --
+    // cache affinity keys and abuse-tracking identifiers. NInfer's prefix cache matches purely
+    // on prompt content, so dropping them changes nothing semantically, while rejecting them
+    // hard-fails otherwise valid Responses clients (nearly all always send prompt_cache_key).
+    // Accept and ignore instead of 400 parameter_not_supported.
     for (const char* key : {"context_management", "conversation", "max_tool_calls", "moderation",
-                            "prompt", "prompt_cache_key", "prompt_cache_options",
-                            "prompt_cache_retention", "safety_identifier", "user"}) {
+                            "prompt"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
         }
@@ -632,9 +722,14 @@ void reject_server_managed_features(const Json& body) {
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("additional response fields are not supported", "include",
-                        "include_not_supported");
+        // NOTE(local-v100 2026-10-29): 'include' only requests EXTRA fields in the response
+        // (reasoning.encrypted_content, message.output_text.logprobs, ...). NInfer never emits
+        // them, so the honest behaviour is to ignore the hint rather than fail the whole call --
+        // any client that ships a default non-empty include list is otherwise unusable here.
+        for (const Json& entry : body.at("include")) {
+            if (!entry.is_string()) {
+                bad_request("include must be an array of strings", "include");
+            }
         }
     }
     if (body.contains("parallel_tool_calls") && !body.at("parallel_tool_calls").is_null()) {
@@ -939,8 +1034,33 @@ Json in_progress_response(const std::string& id, std::int64_t created_at,
 
 } // namespace
 
+namespace {
+void log_rejected_request_shape(const Json& body) {
+    std::string keys;
+    if (body.is_object()) {
+        for (auto it = body.begin(); it != body.end(); ++it) {
+            if (!keys.empty()) { keys += ", "; }
+            keys += it.key();
+            if (it.key() == "include" || it.key() == "reasoning" || it.key() == "tool_choice" ||
+                it.key() == "stream_options") {
+                keys += "=" + it.value().dump().substr(0, 160);
+            } else if (it.key() == "tools" && it.value().is_array()) {
+                keys += "[" + std::to_string(it.value().size()) + " items]";
+            }
+        }
+    }
+    std::fprintf(stderr, "[ninfer-serve] responses request rejected; top-level params: %s\n",
+                 keys.c_str());
+}
+} // namespace
+
 ResponsesRequest parse_responses_request(const Json& body, const RequestLimits& limits) {
-    return parse_request_impl(body, limits);
+    try {
+        return parse_request_impl(body, limits);
+    } catch (const ApiException&) {
+        log_rejected_request_shape(body);
+        throw;
+    }
 }
 
 ResponsesRequest parse_response_input_tokens_request(const Json& body,
