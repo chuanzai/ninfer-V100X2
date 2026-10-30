@@ -225,8 +225,16 @@ std::vector<float> host_vision_attention(std::span<const float> qkv,
     // single parallel region and each thread owns its score tile. BLAS is pinned to one
     // thread inside it: at these GEMM sizes the per-call worker wakeup (sched_yield spin)
     // cost more than the math, and nesting BLAS threads under OpenMP oversubscribes badly.
-    const int blas_threads = openblas_get_num_threads();
-    openblas_set_num_threads(1);
+    // RAII so an exception between here and the end of the pass cannot leave the process
+    // with BLAS pinned to a single thread, which would quietly cost the text path 4x.
+    struct BlasThreadGuard {
+        int saved;
+        explicit BlasThreadGuard(int threads) : saved(threads) { openblas_set_num_threads(1); }
+        ~BlasThreadGuard() { openblas_set_num_threads(saved); }
+        BlasThreadGuard(const BlasThreadGuard&) = delete;
+        BlasThreadGuard& operator=(const BlasThreadGuard&) = delete;
+    };
+    const BlasThreadGuard blas_guard(openblas_get_num_threads());
     std::vector<float> planes;
     for (std::size_t segment = 1; segment < cu_seqlens.size(); ++segment) {
         const int begin = cu_seqlens[segment - 1], length = cu_seqlens[segment] - begin;
@@ -286,7 +294,6 @@ std::vector<float> host_vision_attention(std::span<const float> qkv,
             }
         }
     }
-    openblas_set_num_threads(blas_threads);
     return result;
 }
 
