@@ -64,7 +64,19 @@ endif()
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_host_ops STATIC ops/host/vision.cpp)
 ninfer_internal_includes(ninfer_host_ops)
-target_link_libraries(ninfer_host_ops PUBLIC ninfer_core PRIVATE BLAS::BLAS)
+# The CPU Vision encoder fans its per-token and per-query passes out with OpenMP.
+# Without the flag those loops still compile, just single-threaded.
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+# host_vision_attention runs its own OpenMP fan-out and pins BLAS to a single worker inside
+# it, which needs the OpenBLAS thread-control symbols that the generic BLAS ABI does not
+# expose. Link the provider directly on top of BLAS::BLAS.
+find_library(NINFER_BLAS_THREADS_LIBRARY NAMES openblas)
+if(NINFER_BLAS_THREADS_LIBRARY)
+  target_link_libraries(ninfer_host_ops PUBLIC ninfer_core OpenMP::OpenMP_CXX
+    PRIVATE BLAS::BLAS ${NINFER_BLAS_THREADS_LIBRARY})
+else()
+  target_link_libraries(ninfer_host_ops PUBLIC ninfer_core OpenMP::OpenMP_CXX PRIVATE BLAS::BLAS)
+endif()
 
 add_library(ninfer_ops STATIC
   ops/linear/ggml_k/ggml_k.cu
